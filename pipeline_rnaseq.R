@@ -35,7 +35,7 @@ normalize_path_slash <- function(path) {
 base_path <- "/media/puente/sharge/BMK_DATA_20250611162313_1/Data"
 
 # Ruta donde queremos guardar tal cual los resultados (copiar y pegar tal cual la de el sistema operativo)
-output_path <- "."
+output_path <- "/media/puente/Expansion/Resultados_Primers"
 
 # Adaptamos las rutas para que siempre guncione
 data_path <- normalize_path_slash(base_path)
@@ -94,34 +94,29 @@ preparar_referencia <- function(especie) {
   dir.create(ref_dir, recursive = TRUE, showWarnings = FALSE)
   dir.create(index_dir, recursive = TRUE, showWarnings = FALSE)
   
-  # ===== Detectar FASTA local =====
+  # ===== Detectar o descargar FASTA =====
   fasta_file <- list.files(ref_dir, pattern = paste0("^", especie, "\\.(fa|fna)$"), full.names = TRUE)
-  
   if (length(fasta_file) == 0) {
-    # No existe, descargar
     tmp_file <- file.path(ref_dir, "tmp_genome.gz")
-    options(timeout = 600)  # aumentar tiempo de espera a 10 minutos
+    options(timeout = 600)
     download.file(urls$fasta, destfile = tmp_file, mode = "wb")
-    
-    # Definir extensión final (.fa o .fna según preferencia)
     ext <- ifelse(grepl("\\.fna\\.gz$", urls$fasta, ignore.case = TRUE), "fna", "fa")
     fasta_file <- file.path(ref_dir, paste0(especie, ".", ext))
-    
-    # Descomprimir
     gunzip(tmp_file, destname = fasta_file, remove = TRUE, overwrite = TRUE)
   } else {
-    fasta_file <- fasta_file[1]  # tomar el primero si hay más de uno
+    fasta_file <- fasta_file[1]
   }
   
-  # ===== Detectar GTF/GFF local =====
+  # ===== Detectar o descargar GTF/GFF =====
   gtf_file <- list.files(ref_dir, pattern = paste0("^", especie, "\\.(gtf|gff|gff3)$"), full.names = TRUE)
   if (length(gtf_file) == 0) {
-    # No existe, descargar
     tmp_gtf <- file.path(ref_dir, "tmp_annotation.gz")
     download.file(urls$gtf, destfile = tmp_gtf, mode = "wb")
     descomprimido <- sub("\\.gz$", "", tmp_gtf)
-    gunzip(tmp_gtf, destname = descomprimido)
-    ext <- tools::file_ext(descomprimido)
+    gunzip(tmp_gtf, destname = descomprimido, overwrite = TRUE)
+    
+    # Extraer extensión correcta de la URL
+    ext <- sub(".*\\.(gtf|gff3?|GTF|GFF3?)\\.gz$", "\\1", urls$gtf, ignore.case = TRUE)
     gtf_file <- file.path(ref_dir, paste0(especie, ".", ext))
     file.rename(descomprimido, gtf_file)
   } else {
@@ -172,27 +167,52 @@ alinear_muestra <- function(fq1, fq2, index_path, output_bam) {
 # Cuenta lecturas alineadas por gen usando featureCounts.
 # Además guarda archivos de conteo por muestra.
 # =========================================================
-cuantificar_todas <- function(bam_files, gtf_path, especie) {
-  is_gtf <- grepl("\\.gtf$", gtf_path, ignore.case = TRUE)
-  fc <- featureCounts(
-    files = bam_files,
-    annot.ext = gtf_path,
-    isGTFAnnotationFile = is_gtf,
-    GTF.featureType = "exon",
-    GTF.attrType = "gene_id",
-    isPairedEnd = TRUE,
-    nthreads = 4
-  )
+cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) {
+  
+  # Detectar extensión del archivo de anotación
+  ext <- tolower(tools::file_ext(annotation_file))
+  
+  if (ext %in% c("gtf", "gff", "gff3")) {
+    # Importar para revisar atributos
+    gtf_obj <- rtracklayer::import(annotation_file)
+    attr_type <- ifelse("gene_id" %in% colnames(mcols(gtf_obj)), "gene_id", "ID")
+    
+    fc <- featureCounts(
+      files = bam_files,
+      annot.ext = annotation_file,
+      isGTFAnnotationFile = TRUE,
+      GTF.featureType = "exon",
+      GTF.attrType = attr_type,
+      isPairedEnd = TRUE,
+      nthreads = 4
+    )
+  } else {
+    # SAF
+    fc <- featureCounts(
+      files = bam_files,
+      annot.ext = annotation_file,
+      isGTFAnnotationFile = FALSE,
+      isPairedEnd = TRUE,
+      nthreads = 4
+    )
+  }
   
   counts_matrix <- fc$counts
+  
+  # Guardar archivos de conteo por muestra
   for (i in seq_len(ncol(counts_matrix))) {
     sample_name <- colnames(counts_matrix)[i]
     df <- data.frame(Gene = rownames(counts_matrix), Count = counts_matrix[, i])
-    write.csv(df, file = file.path(output_base, "output", especie, paste0(sample_name, "_counts.csv")), row.names = FALSE)
+    outdir_esp <- file.path(output_base, "output", especie)
+    dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
+    write.csv(df, file.path(outdir_esp, paste0(sample_name, "_counts.csv")), row.names = FALSE)
   }
   
   return(counts_matrix)
 }
+
+
+
 
 # =========================================================
 # 📊 resumen_genes_diferenciales()
@@ -358,7 +378,16 @@ for (esp in species_list) {
       hacer_qc_fastq(fq1, qc_dir)
     }
     
-    if (!file.exists(bam_out)) {
+    bam_existe_y_valido <- file.exists(bam_out) && file.size(bam_out) > 0
+    
+    if (bam_existe_y_valido) {
+      message("⏩ BAM already exists and is valid for ", sid, ". Skipping alignment.")
+    } else {
+      message("🎯 Aligning sample: ", sid)
+      # Validation for raw data path is crucial here
+      if (!file.exists(fq1) || !file.exists(fq2)) {
+        stop(paste0("❌ FASTQ file(s) not found for sample ", sid, ". Check paths in 'muestras.csv' relative to 'base_path'."))
+      }
       alinear_muestra(fq1, fq2, ref$index, bam_out)
     }
     
