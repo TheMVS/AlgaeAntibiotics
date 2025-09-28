@@ -144,6 +144,25 @@ alinear_muestra <- function(fq1, fq2, index_path, output_bam) {
 # 🔢 Función cuantificación
 # =========================================================
 cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) {
+  outdir_esp <- file.path(output_base, "output", especie)
+  dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
+  count_flag <- file.path(outdir_esp, "counts_done.flag")
+  
+  # Si ya existen los conteos, los leemos
+  if (file.exists(count_flag)) {
+    message("⏩ Conteos ya calculados para ", especie)
+    # Leer todos los CSV de conteo y reconstruir la matriz
+    count_files <- list.files(outdir_esp, pattern = "_counts\\.csv$", full.names = TRUE)
+    counts_list <- lapply(count_files, function(f) {
+      df <- read.csv(f, stringsAsFactors = FALSE)
+      setNames(df$Count, df$Gene)
+    })
+    count_matrix <- do.call(cbind, counts_list)
+    colnames(count_matrix) <- gsub("_counts\\.csv$", "", basename(count_files))
+    return(count_matrix)
+  }
+  
+  # Si no existen los conteos, calcular
   ext <- tolower(tools::file_ext(annotation_file))
   if (ext %in% c("gtf", "gff", "gff3")) {
     gtf_obj <- rtracklayer::import(annotation_file)
@@ -155,16 +174,18 @@ cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) 
     fc <- featureCounts(files = bam_files, annot.ext = annotation_file,
                         isGTFAnnotationFile = FALSE, isPairedEnd = TRUE, nthreads = 4)
   }
-  counts_matrix <- fc$counts
-  colnames(counts_matrix) <- sub(".bam$", "", basename(bam_files))
-  for (i in seq_len(ncol(counts_matrix))) {
-    sample_name <- colnames(counts_matrix)[i]
-    df <- data.frame(Gene = rownames(counts_matrix), Count = counts_matrix[, i])
-    outdir_esp <- file.path(output_base, "output", especie)
-    dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
+  
+  count_matrix <- fc$counts
+  colnames(count_matrix) <- sub(".bam$", "", basename(bam_files))
+  for (i in seq_len(ncol(count_matrix))) {
+    sample_name <- colnames(count_matrix)[i]
+    df <- data.frame(Gene = rownames(count_matrix), Count = count_matrix[, i])
     write.csv(df, file.path(outdir_esp, paste0(sample_name, "_counts.csv")), row.names = FALSE)
   }
-  return(counts_matrix)
+  
+  # Crear flag para indicar que los conteos ya se hicieron
+  file.create(count_flag)
+  return(count_matrix)
 }
 
 # =========================================================
@@ -198,34 +219,56 @@ generar_mds_plot <- function(dds, output_file) {
 }
 
 # =========================================================
-# 🔬 DESeq2
+# 🔬 DESeq2 con Heatmap
 # =========================================================
 comparaciones_deseq <- function(conteos, diseno, comparaciones_esp, output_dir, gtf_file, muestras_esp) {
   dir.create(output_dir, showWarnings = FALSE)
+  flag_file <- file.path(output_dir, "deseq_done.flag")
+  if (file.exists(flag_file)) {
+    message("⏩ DESeq2 ya ejecutado previamente en ", output_dir)
+    return(invisible(NULL))
+  }
   
-  # Alinear nombres
   colnames(conteos) <- muestras_esp$sample_id
   colData <- data.frame(condition = factor(diseno), row.names = names(diseno))
-  
-  # Crear objeto DESeq2
-  dds <- DESeqDataSetFromMatrix(
-    countData = conteos,
-    colData   = colData,
-    design    = ~condition
-  )
-  
-  # Ejecutar DESeq
+  dds <- DESeqDataSetFromMatrix(countData = conteos, colData = colData, design = ~condition)
   dds <- DESeq(dds)
   
-  # MDS Plot
+  # MDS
   generar_mds_plot(dds, file.path(output_dir, "MDS_plot.png"))
   
-  # Loop de comparaciones
+  # Heatmap
+  heatmap_file <- file.path(output_dir, "heatmap_genes_mas_variables.png")
+  if (!file.exists(heatmap_file)) {
+    vsd <- vst(dds, blind = TRUE)
+    topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+    mat <- assay(vsd)[topVarGenes, ]
+    mat <- mat - rowMeans(mat)
+    
+    # ✅ FIX: asegurar que annotation_col tenga rownames que coincidan con columnas de mat
+    annotation_col <- data.frame(condition = colData$condition)
+    rownames(annotation_col) <- rownames(colData)
+    
+    png(heatmap_file, width = 2000, height = 2000, res = 300)
+    pheatmap(mat,
+             cluster_rows = TRUE,
+             cluster_cols = TRUE,
+             show_rownames = TRUE,
+             annotation_col = annotation_col)
+    dev.off()
+  }
+  
+  # Loop comparaciones
   for (i in 1:nrow(comparaciones_esp)) {
     condA <- comparaciones_esp$control[i]
     condB <- comparaciones_esp$treat[i]
-    csv_file <- file.path(output_dir, paste0("DESeq2_", condA, "_vs_", condB, ".csv"))
     
+    if (!(condA %in% colData$condition) || !(condB %in% colData$condition)) {
+      message("⚠️ Saltando comparación DESeq2 inválida: ", condA, " vs ", condB)
+      next
+    }
+    
+    csv_file <- file.path(output_dir, paste0("DESeq2_", condA, "_vs_", condB, ".csv"))
     if (file.exists(csv_file)) {
       message("⏩ Resultados DESeq2 ", condA, " vs ", condB, " ya existen.")
       next
@@ -238,6 +281,51 @@ comparaciones_deseq <- function(conteos, diseno, comparaciones_esp, output_dir, 
     resumen <- resumen_genes_diferenciales(res_df)
     write.csv(resumen, file.path(output_dir, paste0("summary_", condA, "_vs_", condB, ".csv")), row.names = FALSE)
   }
+  
+  file.create(flag_file)
+}
+
+
+# =========================================================
+# 💻 Limma-voom
+# =========================================================
+comparaciones_limma <- function(counts, diseno, comparaciones_esp, output_dir, muestras_esp) {
+  flag_file <- file.path(output_dir, "limma_done.flag")
+  if (file.exists(flag_file)) {
+    message("⏩ Limma ya ejecutado previamente en ", output_dir)
+    return(invisible(NULL))
+  }
+  
+  colnames(counts) <- muestras_esp$sample_id
+  design <- model.matrix(~0 + factor(diseno))
+  colnames(design) <- levels(factor(diseno))
+  
+  y <- DGEList(counts = counts)
+  y <- calcNormFactors(y)
+  v <- voom(y, design, plot = FALSE)
+  
+  for (i in 1:nrow(comparaciones_esp)) {
+    condA <- comparaciones_esp$control[i]
+    condB <- comparaciones_esp$treat[i]
+    
+    if (!(condA %in% colnames(design)) || !(condB %in% colnames(design))) {
+      message("⚠️ Saltando comparación Limma inválida: ", condA, " vs ", condB)
+      next
+    }
+    
+    contrast_matrix <- makeContrasts(contrasts = paste0(condB, "-", condA), levels = design)
+    fit <- lmFit(v, design)
+    fit2 <- contrasts.fit(fit, contrast_matrix)
+    fit2 <- eBayes(fit2)
+    
+    csv_file <- file.path(output_dir, paste0("limma_", condA, "_vs_", condB, ".csv"))
+    if (!file.exists(csv_file)) {
+      res_df <- topTable(fit2, number = Inf, adjust.method = "BH")
+      write.csv(res_df, csv_file)
+    }
+  }
+  
+  file.create(flag_file)
 }
 
 # =========================================================
@@ -256,7 +344,6 @@ for (esp in species_list) {
   dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
   
   bam_files <- c()
-  
   for (i in 1:nrow(muestras_esp)) {
     sid <- muestras_esp$sample_id[i]
     fq1 <- file.path(data_path, muestras_esp$read1[i])
@@ -272,9 +359,13 @@ for (esp in species_list) {
   # Cuantificación
   count_matrix <- cuantificar_todas(bam_files, ref$gtf, esp, output_base)
   
-  # Subset de comparaciones para esta especie
-  compar_esp <- comparaciones[comparaciones$species==esp, c("control", "treat")]
+  # Subset de comparaciones válidas para esta especie
+  compar_esp <- comparaciones[(comparaciones$control %in% diseno) & (comparaciones$treat %in% diseno),]
   
   # Ejecutar DESeq2
   comparaciones_deseq(count_matrix, diseno, compar_esp, outdir_esp, ref$gtf, muestras_esp)
+  
+  # Ejecutar Limma-voom
+  comparaciones_limma(count_matrix, diseno, compar_esp, outdir_esp, muestras_esp)
 }
+
