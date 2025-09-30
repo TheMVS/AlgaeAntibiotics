@@ -151,7 +151,6 @@ cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) 
   # Si ya existen los conteos, los leemos
   if (file.exists(count_flag)) {
     message("⏩ Conteos ya calculados para ", especie)
-    # Leer todos los CSV de conteo y reconstruir la matriz
     count_files <- list.files(outdir_esp, pattern = "_counts\\.csv$", full.names = TRUE)
     counts_list <- lapply(count_files, function(f) {
       df <- read.csv(f, stringsAsFactors = FALSE)
@@ -162,31 +161,58 @@ cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) 
     return(count_matrix)
   }
   
-  # Si no existen los conteos, calcular
+  # Determinar extensión de la anotación
   ext <- tolower(tools::file_ext(annotation_file))
+  
   if (ext %in% c("gtf", "gff", "gff3")) {
-    gtf_obj <- rtracklayer::import(annotation_file)
-    attr_type <- ifelse("gene_id" %in% colnames(mcols(gtf_obj)), "gene_id", "ID")
-    fc <- featureCounts(files = bam_files, annot.ext = annotation_file,
-                        isGTFAnnotationFile = TRUE, GTF.featureType = "exon",
-                        GTF.attrType = attr_type, isPairedEnd = TRUE, nthreads = 4)
+    # Detectar automáticamente qué atributo usar
+    gtf_lines <- readLines(annotation_file, n = 200)
+    has_gene_id <- any(grepl("gene_id", gtf_lines))
+    has_id <- any(grepl("\\bID=", gtf_lines))
+    
+    if (has_gene_id) {
+      attr_type <- "gene_id"
+    } else if (has_id) {
+      attr_type <- "ID"
+    } else {
+      stop("❌ No se encontró ni 'gene_id' ni 'ID' en el archivo de anotación: ", annotation_file)
+    }
+    
+    message("👉 Usando GTF.attrType = '", attr_type, "' para ", especie)
+    
+    fc <- featureCounts(
+      files = bam_files,
+      annot.ext = annotation_file,
+      isGTFAnnotationFile = TRUE,
+      GTF.featureType = "exon",
+      GTF.attrType = attr_type,
+      isPairedEnd = TRUE,
+      nthreads = 4
+    )
   } else {
-    fc <- featureCounts(files = bam_files, annot.ext = annotation_file,
-                        isGTFAnnotationFile = FALSE, isPairedEnd = TRUE, nthreads = 4)
+    fc <- featureCounts(
+      files = bam_files,
+      annot.ext = annotation_file,
+      isGTFAnnotationFile = FALSE,
+      isPairedEnd = TRUE,
+      nthreads = 4
+    )
   }
   
   count_matrix <- fc$counts
   colnames(count_matrix) <- sub(".bam$", "", basename(bam_files))
+  
+  # Guardar conteos individuales
   for (i in seq_len(ncol(count_matrix))) {
     sample_name <- colnames(count_matrix)[i]
     df <- data.frame(Gene = rownames(count_matrix), Count = count_matrix[, i])
     write.csv(df, file.path(outdir_esp, paste0(sample_name, "_counts.csv")), row.names = FALSE)
   }
   
-  # Crear flag para indicar que los conteos ya se hicieron
   file.create(count_flag)
   return(count_matrix)
 }
+
 
 # =========================================================
 # 📊 Resumen DEGs
@@ -349,6 +375,10 @@ for (esp in species_list) {
     fq1 <- file.path(data_path, muestras_esp$read1[i])
     fq2 <- file.path(data_path, muestras_esp$read2[i])
     bam_out <- file.path(outdir_esp, paste0(sid, ".bam"))
+    
+    qc_dir <- file.path(outdir_esp, paste0("QC_", sid))
+    
+    if (!dir.exists(qc_dir)) hacer_qc_fastq(fq1, qc_dir) # TODO CHECK
     
     if (!file.exists(bam_out)) {
       alinear_muestra(fq1, fq2, ref$index, bam_out)
