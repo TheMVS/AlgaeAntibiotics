@@ -29,7 +29,7 @@ normalize_path_slash <- function(path) {
 # 📝 Variables de usuario
 # =========================================================
 base_path <- "/media/puente/sharge/BMK_DATA_20250611162313_1/Data"
-output_path <- "/media/puente/Expansion/Resultados_Primers"
+output_path <- "/media/puente/Expansion/Resultados_Raw"
 data_path <- normalize_path_slash(base_path)
 output_base <- normalize_path_slash(output_path)
 
@@ -40,7 +40,7 @@ dir.create(file.path(output_base, "output"), showWarnings = FALSE, recursive = T
 # =========================================================
 # 📂 Lectura de metadata
 # =========================================================
-samples <- read.csv(file.path(".", "muestras.csv"), stringsAsFactors = FALSE)
+samples <- read.csv(file.path(".", "muestras_raw.csv"), stringsAsFactors = FALSE)
 comparaciones <- read.csv(file.path(".", "comparaciones.csv"), stringsAsFactors = FALSE)
 
 # Normalizar rutas
