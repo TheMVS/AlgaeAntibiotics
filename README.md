@@ -96,7 +96,7 @@ Place the following CSV files in your data folder:
 
 ## Outputs
 
-All outputs will be stored in `output_base/output/<species>`:
+All outputs will be stored in `output/<species>`:
 
 * BAM files for each sample
 * Count matrices per species
