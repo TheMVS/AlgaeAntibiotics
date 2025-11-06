@@ -1,35 +1,39 @@
+# =========================================================
+# 🧩 Instalación de librerías necesarias (solo 1ª vez)
+# =========================================================
 #if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-#BiocManager::install(c("ShortRead", "Rsubread", "DESeq2", "pheatmap", "rtracklayer",
-#                       "clusterProfiler", "AnnotationDbi", "limma", "edgeR", "topGO", 
-#                       "biomaRt", "org.At.tair.db"))
 
+#BiocManager::install(c("ShortRead", "Rsubread", "DESeq2", "pheatmap", "rtracklayer", "clusterProfiler", "AnnotationDbi", "edgeR", "biomaRt"), force = TRUE)
+
+#install.packages(c("openxlsx", "dplyr", "R.utils", "ggplot2"))
+
+# =========================================================
+# 📚 Librerías
+# =========================================================
 library(ShortRead)
 library(Rsubread)
 library(DESeq2)
 library(pheatmap)
-library(R.utils)
 library(rtracklayer)
 library(clusterProfiler)
 library(AnnotationDbi)
 library(dplyr)
 library(edgeR)
-library(limma)
-library(topGO)
 library(biomaRt)
-library(org.At.tair.db)
+library(openxlsx)
+library(R.utils)
+library(ggplot2)
 
 # =========================================================
 # 🔧 Función para normalizar rutas
 # =========================================================
-normalize_path_slash <- function(path) {
-  gsub("\\\\", "/", path)
-}
+normalize_path_slash <- function(path) gsub("\\\\", "/", path)
 
 # =========================================================
 # 📝 Variables de usuario
 # =========================================================
 base_path <- "/media/puente/sharge/BMK_DATA_20250611162313_1/Data"
-output_path <- "/media/puente/Expansion/Resultados_Raw"
+output_path <- "/media/puente/Expansion/Resultados_Primers_Filtrados"
 data_path <- normalize_path_slash(base_path)
 output_base <- normalize_path_slash(output_path)
 
@@ -40,17 +44,10 @@ dir.create(file.path(output_base, "output"), showWarnings = FALSE, recursive = T
 # =========================================================
 # 📂 Lectura de metadata
 # =========================================================
-samples <- read.csv(file.path(".", "muestras_raw.csv"), stringsAsFactors = FALSE)
-comparaciones <- read.csv(file.path(".", "comparaciones.csv"), stringsAsFactors = FALSE)
+samples <- read.csv("muestras.csv", stringsAsFactors = FALSE)
+comparaciones <- read.csv("comparaciones.csv", stringsAsFactors = FALSE)
 
-# Normalizar rutas
-if ("read1" %in% names(samples)) samples$read1 <- normalize_path_slash(samples$read1)
-if ("read2" %in% names(samples)) samples$read2 <- normalize_path_slash(samples$read2)
-if ("sample_id" %in% names(samples)) samples$sample_id <- normalize_path_slash(samples$sample_id)
-
-# Validaciones
-if (!"species" %in% names(samples)) stop("❌ Falta la columna 'species' en samples")
-if (nrow(samples) < 2) stop("❌ Se requieren al menos 2 muestras")
+if (!"species" %in% names(samples)) stop("❌ Falta columna 'species' en samples")
 species_list <- unique(samples$species)
 
 # =========================================================
@@ -68,7 +65,7 @@ ref_urls <- list(
 )
 
 # =========================================================
-# 🧬 Función para preparar referencia
+# 🧬 Preparar referencias
 # =========================================================
 preparar_referencia <- function(especie) {
   urls <- ref_urls[[especie]]
@@ -82,6 +79,7 @@ preparar_referencia <- function(especie) {
   if (length(fasta_file) > 0) {
     message("⏩ FASTA ya existe para ", especie)
     fasta_file <- fasta_file[1]
+    ext <- tolower(tools::file_ext(fasta_file))
   } else {
     tmp_file <- file.path(ref_dir, "tmp_genome.gz")
     options(timeout = 600)
@@ -96,6 +94,7 @@ preparar_referencia <- function(especie) {
   if (length(gtf_file) > 0) {
     message("⏩ GTF/GFF ya existe para ", especie)
     gtf_file <- gtf_file[1]
+    ext <- tolower(tools::file_ext(gtf_file))
   } else {
     tmp_gtf <- file.path(ref_dir, "tmp_annotation.gz")
     download.file(urls$gtf, destfile = tmp_gtf, mode = "wb")
@@ -116,9 +115,8 @@ preparar_referencia <- function(especie) {
   
   list(fasta = fasta_file, gtf = gtf_file, index = index_prefix)
 }
-
 # =========================================================
-# 🧪 Función QC FASTQ
+# 🧪 QC FASTQ
 # =========================================================
 hacer_qc_fastq <- function(fq_path, outdir) {
   dir.create(outdir, showWarnings = FALSE)
@@ -127,245 +125,302 @@ hacer_qc_fastq <- function(fq_path, outdir) {
 }
 
 # =========================================================
-# 🎯 Función alinear
+# 🎯 Alineación
 # =========================================================
 alinear_muestra <- function(fq1, fq2, index_path, output_bam) {
-  fq1 <- normalize_path_slash(fq1)
-  fq2 <- normalize_path_slash(fq2)
-  output_bam <- normalize_path_slash(output_bam)
-  if (!file.exists(fq1)) stop("❌ FASTQ1 not found: ", fq1)
-  if (!file.exists(fq2)) stop("❌ FASTQ2 not found: ", fq2)
+  if (file.exists(output_bam)) {
+    message("⏩ BAM existente: ", output_bam)
+    return()
+  }
   align(index = index_path, readfile1 = fq1, readfile2 = fq2,
         output_file = output_bam, input_format = "gzFASTQ",
         output_format = "BAM", nthreads = 4)
 }
 
 # =========================================================
-# 🔢 Función cuantificación
+# 🔢 Cuantificación
 # =========================================================
 cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) {
   outdir_esp <- file.path(output_base, "output", especie)
   dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
-  count_flag <- file.path(outdir_esp, "counts_done.flag")
   
-  # Si ya existen los conteos, los leemos
-  if (file.exists(count_flag)) {
-    message("⏩ Conteos ya calculados para ", especie)
-    count_files <- list.files(outdir_esp, pattern = "_counts\\.csv$", full.names = TRUE)
-    counts_list <- lapply(count_files, function(f) {
-      df <- read.csv(f, stringsAsFactors = FALSE)
-      setNames(df$Count, df$Gene)
-    })
-    count_matrix <- do.call(cbind, counts_list)
-    colnames(count_matrix) <- gsub("_counts\\.csv$", "", basename(count_files))
-    return(count_matrix)
+  count_file <- file.path(outdir_esp, "count_matrix.csv")
+  if (file.exists(count_file)) {
+    message("⏩ Conteos existentes, se cargan.")
+    return(read.csv2(count_file, row.names = 1))
   }
   
-  # Determinar extensión de la anotación
+  # Detectar formato
   ext <- tolower(tools::file_ext(annotation_file))
   
-  if (ext %in% c("gtf", "gff", "gff3")) {
-    # Detectar automáticamente qué atributo usar
-    gtf_lines <- readLines(annotation_file, n = 200)
-    has_gene_id <- any(grepl("gene_id", gtf_lines))
-    has_id <- any(grepl("\\bID=", gtf_lines))
+  # Leer primeras líneas para decidir cómo proceder
+  gtf_lines <- readLines(annotation_file, n = 200)
+  has_gene_id <- any(grepl("gene_id", gtf_lines))
+  has_parent <- any(grepl("Parent=", gtf_lines))
+  has_id <- any(grepl("ID=", gtf_lines))
+  
+  # Elegir configuración según tipo
+  if (ext %in% c("gtf")) {
+    # NCBI usa gene_id
+    attr_type <- "gene_id"
+    feature_type <- "exon"
+    message("🧬 Archivo GTF detectado, usando attrType='", attr_type, "' y featureType='", feature_type, "'")
     
-    if (has_gene_id) {
-      attr_type <- "gene_id"
-    } else if (has_id) {
-      attr_type <- "ID"
-    } else {
-      stop("❌ No se encontró ni 'gene_id' ni 'ID' en el archivo de anotación: ", annotation_file)
-    }
+  } else if (ext %in% c("gff", "gff3")) {
+    # Phytozome usa Parent e IDs con exones
+    attr_type <- "Parent"
+    feature_type <- "exon"
+    message("🧬 Archivo GFF3 detectado, usando attrType='", attr_type, "' y featureType='", feature_type, "'")
     
-    message("👉 Usando GTF.attrType = '", attr_type, "' para ", especie)
-    
-    fc <- featureCounts(
-      files = bam_files,
-      annot.ext = annotation_file,
-      isGTFAnnotationFile = TRUE,
-      GTF.featureType = "exon",
-      GTF.attrType = attr_type,
-      isPairedEnd = TRUE,
-      nthreads = 4
-    )
   } else {
-    fc <- featureCounts(
-      files = bam_files,
-      annot.ext = annotation_file,
-      isGTFAnnotationFile = FALSE,
-      isPairedEnd = TRUE,
-      nthreads = 4
-    )
+    stop("❌ No se reconoce el formato de anotación: ", annotation_file)
   }
   
+  # Ejecutar featureCounts
+  fc <- featureCounts(
+    files = bam_files,
+    annot.ext = annotation_file,
+    isGTFAnnotationFile = TRUE,
+    GTF.featureType = feature_type,
+    GTF.attrType = attr_type,
+    isPairedEnd = TRUE,
+    nthreads = 4
+  )
+  
+  # Limpiar IDs si vienen con '.exon.#'
+  rownames(fc$counts) <- sub("\\.exon\\..*$", "", rownames(fc$counts))
+  
+  # Guardar resultados
   count_matrix <- fc$counts
   colnames(count_matrix) <- sub(".bam$", "", basename(bam_files))
+  count_df <- data.frame(GeneID = rownames(count_matrix), count_matrix, check.names = FALSE)
+  write.table(count_df, count_file, sep=";", col.names=NA)
+  openxlsx::write.xlsx(count_df, file.path(outdir_esp, "count_matrix.xlsx"))
   
-  # Guardar conteos individuales
-  for (i in seq_len(ncol(count_matrix))) {
-    sample_name <- colnames(count_matrix)[i]
-    df <- data.frame(Gene = rownames(count_matrix), Count = count_matrix[, i])
-    write.csv(df, file.path(outdir_esp, paste0(sample_name, "_counts.csv")), row.names = FALSE)
-  }
-  
-  file.create(count_flag)
   return(count_matrix)
 }
 
+# =========================================================
+# ⚙️ Parámetros de filtrado globales
+# =========================================================
+umbral_expr <- 10  # 🔹 Puedes ajustar este valor para cambiar el umbral de expresión mínima
 
 # =========================================================
-# 📊 Resumen DEGs
+# 🧹 Filtrado de genes poco expresados (edgeR)
 # =========================================================
-resumen_genes_diferenciales <- function(res_df, logfc_threshold = 1, padj_threshold = 0.05) {
-  res_df <- na.omit(res_df)
-  up <- sum(res_df$log2FoldChange > logfc_threshold & res_df$padj < padj_threshold)
-  down <- sum(res_df$log2FoldChange < -logfc_threshold & res_df$padj < padj_threshold)
-  total <- nrow(res_df)
-  data.frame(Upregulated = up, Downregulated = down, Total = total)
+filtrar_genes_bajos <- function(count_matrix, group, especie, output_base, umbral = umbral_expr) {
+  message("🔎 Filtrando genes con umbral de expresión mínimo = ", umbral)
+  
+  # Crear objeto DGEList
+  y <- DGEList(counts = count_matrix, group = group)
+  
+  total_genes <- nrow(y$counts)
+  
+  # Filtrado con umbral configurable
+  keep <- filterByExpr(y, group = group, min.count = umbral)
+  filtered <- y$counts[keep, ]
+  
+  genes_filtrados <- nrow(filtered)
+  porcentaje <- round((genes_filtrados / total_genes) * 100, 2)
+  
+  message("✅ Genes retenidos: ", genes_filtrados, " / ", total_genes, " (", porcentaje, "%)")
+  
+  # Crear resumen
+  resumen <- data.frame(
+    Especie = especie,
+    Genes_totales = total_genes,
+    Genes_retenidos = genes_filtrados,
+    Porcentaje_retenidos = porcentaje,
+    Umbral_usado = umbral
+  )
+  
+  # Guardar resumen
+  outdir_esp <- file.path(output_base, "output", especie)
+  dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
+  
+  resumen_csv <- file.path(outdir_esp, paste0("resumen_filtrado_", especie, ".csv"))
+  resumen_xlsx <- file.path(outdir_esp, paste0("resumen_filtrado_", especie, ".xlsx"))
+  
+  write.csv(resumen, resumen_csv, row.names = FALSE)
+  openxlsx::write.xlsx(resumen, resumen_xlsx, row.names = FALSE)
+  
+  return(filtered)
 }
 
-# =========================================================
-# 🧭 MDS Plot
-# =========================================================
-generar_mds_plot <- function(dds, output_file) {
-  if (file.exists(output_file)) {
-    message("⏩ MDS plot ya existe, se omite.")
-    return()
-  }
-  vsd <- vst(dds, blind = TRUE)
-  d <- dist(t(assay(vsd)))
-  mds <- cmdscale(d)
-  conds <- colData(vsd)$condition
-  png(output_file, width = 2000, height = 1600, res = 300)
-  plot(mds, col = as.numeric(factor(conds)), pch = 19,
-       main = "MDS: Sample Clustering", xlab="Dim 1", ylab="Dim 2")
-  legend("topright", legend = levels(factor(conds)), col = 1:length(levels(factor(conds))), pch = 19)
-  dev.off()
-}
 
 # =========================================================
-# 🔬 DESeq2 con Heatmap
+# 🌿 Anotación y enriquecimiento funcional
 # =========================================================
-comparaciones_deseq <- function(conteos, diseno, comparaciones_esp, output_dir, gtf_file, muestras_esp) {
-  dir.create(output_dir, showWarnings = FALSE)
-  flag_file <- file.path(output_dir, "deseq_done.flag")
-  if (file.exists(flag_file)) {
-    message("⏩ DESeq2 ya ejecutado previamente en ", output_dir)
-    return(invisible(NULL))
+anotar_y_enriquecer <- function(res_df, especie, output_dir) {
+  sig <- res_df %>% filter(!is.na(padj), padj < 0.05)
+  if (nrow(sig) < 10) {
+    message("⚠️ Menos de 10 genes significativos. Se omite enriquecimiento.")
+    return(NULL)
   }
   
-  colnames(conteos) <- muestras_esp$sample_id
+  # 🔹 Conexión al mart de Ensembl Plants
+  message("🔗 Conectando a Ensembl Plants...")
+  plant_mart <- useEnsemblGenomes(biomart = "plants_mart", host = "https://plants.ensembl.org")
+  
+  # 🔹 Selección automática de dataset y organismo KEGG
+  if (tolower(especie) == "chlamy") {
+    dataset <- "creinhardtii_eg_gene"
+    org <- "cre"
+  } else if (tolower(especie) == "lolium") {
+    dataset <- "lperenne_eg_gene"
+    org <- "lpe"
+  } else {
+    message("⚠️ Especie no reconocida para anotar_y_enriquecer: ", especie)
+    return(NULL)
+  }
+  
+  message("🧬 Conectando dataset: ", dataset)
+  mart <- useDataset(dataset = dataset, mart = plant_mart)
+  
+  # 🔹 Mapear IDs (de tu tabla a Ensembl)
+  genes_mapeados <- getBM(
+    attributes = c("ensembl_gene_id", "external_gene_name"),
+    filters = "ensembl_gene_id",
+    values = sig$gene_id,
+    mart = mart
+  )
+  
+  if (nrow(genes_mapeados) == 0) {
+    message("⚠️ No se pudieron mapear IDs de genes para ", especie)
+    return(NULL)
+  }
+  
+  sig$mapped_gene <- genes_mapeados$external_gene_name[
+    match(sig$gene_id, genes_mapeados$ensembl_gene_id)
+  ]
+  
+  mapped_genes <- na.omit(unique(sig$mapped_gene))
+  
+  # 🔹 Enriquecimiento KEGG
+  message("🔍 Ejecutando enriquecimiento KEGG para ", especie, " (", org, ")...")
+  ekegg <- enrichKEGG(
+    gene = mapped_genes,
+    organism = org,
+    pvalueCutoff = 0.05
+  )
+  
+  if (is.null(ekegg) || nrow(as.data.frame(ekegg)) == 0) {
+    message("⚠️ No se encontraron rutas KEGG significativas para ", especie)
+    return(NULL)
+  }
+  
+  ekegg_df <- as.data.frame(ekegg)
+  write.table(ekegg_df,
+              file.path(output_dir, paste0("KEGG_", especie, ".csv")),
+              sep = ";", row.names = FALSE)
+  openxlsx::write.xlsx(ekegg_df,
+                       file.path(output_dir, paste0("KEGG_", especie, ".xlsx")))
+  
+  message("✅ Enriquecimiento completado para ", especie)
+}
+
+# =========================================================
+# 📊 Volcán y Heatmap
+# =========================================================
+plot_volcano <- function(res_df, output_file) {
+  res_df <- na.omit(res_df)
+  gg <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+    geom_point(aes(color = padj < 0.05 & abs(log2FoldChange) > 1)) +
+    theme_minimal() +
+    xlab("log2 Fold Change") + ylab("-log10(padj)") +
+    scale_color_manual(values = c("grey", "red")) +
+    theme(legend.position = "none")
+  ggsave(output_file, gg, width = 6, height = 5, dpi = 300)
+}
+
+plot_heatmap <- function(dds, output_file) {
+  vsd <- vst(dds, blind = TRUE)
+  topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+  mat <- assay(vsd)[topVarGenes, ]
+  mat <- mat - rowMeans(mat)
+  pheatmap(mat, cluster_rows = TRUE, cluster_cols = TRUE,
+           show_rownames = TRUE, filename = output_file, width = 8, height = 8)
+}
+
+# =========================================================
+# 🔬 DESeq2 + anotación + gráficos
+# =========================================================
+comparaciones_deseq <- function(conteos, diseno, comparaciones_esp, output_dir, especie) {
+  
+  # Flag de control: si el archivo existe, significa que ya se ejecutó DESeq2 previamente
+  res_flag <- file.path(output_dir, "deseq_done.flag")
+  if (file.exists(res_flag)) 
+    return(message("⏩ DESeq2 ya ejecutado."))
+  
+  # Crea la tabla de metadatos de las muestras (colData)
+  # 'diseno' contiene las condiciones (por ejemplo: control, tratado)
+  # names(diseno) son los IDs de las muestras (coinciden con las columnas de 'conteos')
   colData <- data.frame(condition = factor(diseno), row.names = names(diseno))
+  
+  # Crea el objeto DESeqDataSet con la matriz de conteos y las condiciones
+  # 'design = ~condition' define el modelo a ajustar (efecto de la condición experimental)
   dds <- DESeqDataSetFromMatrix(countData = conteos, colData = colData, design = ~condition)
+  
+  # Ejecuta todo el pipeline interno de DESeq2:
+  # 1. Estima factores de normalización (size factors)
+  # 2. Calcula la dispersión por gen (biológica y técnica)
+  # 3. Ajusta el modelo de binomial negativa (NB)
+  # 4. Realiza los tests estadísticos para detectar genes diferencialmente expresados
   dds <- DESeq(dds)
   
-  # MDS
-  generar_mds_plot(dds, file.path(output_dir, "MDS_plot.png"))
+  # Genera un heatmap de los 50 genes con mayor varianza entre muestras
+  # Esto permite ver la separación global entre condiciones
+  plot_heatmap(dds, file.path(output_dir, "heatmap_top50.png"))
   
-  # Heatmap
-  heatmap_file <- file.path(output_dir, "heatmap_genes_mas_variables.png")
-  if (!file.exists(heatmap_file)) {
-    vsd <- vst(dds, blind = TRUE)
-    topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
-    mat <- assay(vsd)[topVarGenes, ]
-    mat <- mat - rowMeans(mat)
-    
-    # ✅ FIX: asegurar que annotation_col tenga rownames que coincidan con columnas de mat
-    annotation_col <- data.frame(condition = colData$condition)
-    rownames(annotation_col) <- rownames(colData)
-    
-    png(heatmap_file, width = 2000, height = 2000, res = 300)
-    pheatmap(mat,
-             cluster_rows = TRUE,
-             cluster_cols = TRUE,
-             show_rownames = TRUE,
-             annotation_col = annotation_col)
-    dev.off()
-  }
-  
-  # Loop comparaciones
+  # Recorre cada comparación indicada en la tabla 'comparaciones_esp'
+  # Cada fila contiene dos condiciones: control y tratada
   for (i in 1:nrow(comparaciones_esp)) {
-    condA <- comparaciones_esp$control[i]
-    condB <- comparaciones_esp$treat[i]
+    condA <- comparaciones_esp$control[i]  # condición control
+    condB <- comparaciones_esp$treat[i]    # condición tratada
     
-    if (!(condA %in% colData$condition) || !(condB %in% colData$condition)) {
-      message("⚠️ Saltando comparación DESeq2 inválida: ", condA, " vs ", condB)
-      next
-    }
-    
-    csv_file <- file.path(output_dir, paste0("DESeq2_", condA, "_vs_", condB, ".csv"))
-    if (file.exists(csv_file)) {
-      message("⏩ Resultados DESeq2 ", condA, " vs ", condB, " ya existen.")
-      next
-    }
-    
+    # Extrae los resultados del contraste (condB vs condA)
+    # Incluye log2FoldChange, estadísticos, p-valor y p ajustado (padj)
     res <- results(dds, contrast = c("condition", condA, condB))
+    
+    # Convierte los resultados en un data.frame para manipularlos fácilmente
     res_df <- as.data.frame(res)
-    write.csv(res_df, csv_file)
+    # Añade una columna con los IDs de los genes
+    res_df$gene_id <- rownames(res_df)
     
-    resumen <- resumen_genes_diferenciales(res_df)
-    write.csv(resumen, file.path(output_dir, paste0("summary_", condA, "_vs_", condB, ".csv")), row.names = FALSE)
-  }
-  
-  file.create(flag_file)
-}
-
-
-# =========================================================
-# 💻 Limma-voom
-# =========================================================
-comparaciones_limma <- function(counts, diseno, comparaciones_esp, output_dir, muestras_esp) {
-  flag_file <- file.path(output_dir, "limma_done.flag")
-  if (file.exists(flag_file)) {
-    message("⏩ Limma ya ejecutado previamente en ", output_dir)
-    return(invisible(NULL))
-  }
-  
-  colnames(counts) <- muestras_esp$sample_id
-  design <- model.matrix(~0 + factor(diseno))
-  colnames(design) <- levels(factor(diseno))
-  
-  y <- DGEList(counts = counts)
-  y <- calcNormFactors(y)
-  v <- voom(y, design, plot = FALSE)
-  
-  for (i in 1:nrow(comparaciones_esp)) {
-    condA <- comparaciones_esp$control[i]
-    condB <- comparaciones_esp$treat[i]
+    # Define nombre de salida para los resultados (CSV y Excel)
+    csv_file <- file.path(output_dir, paste0("DESeq2_", condA, "_vs_", condB, ".csv"))
     
-    if (!(condA %in% colnames(design)) || !(condB %in% colnames(design))) {
-      message("⚠️ Saltando comparación Limma inválida: ", condA, " vs ", condB)
-      next
-    }
-    
-    contrast_matrix <- makeContrasts(contrasts = paste0(condB, "-", condA), levels = design)
-    fit <- lmFit(v, design)
-    fit2 <- contrasts.fit(fit, contrast_matrix)
-    fit2 <- eBayes(fit2)
-    
-    csv_file <- file.path(output_dir, paste0("limma_", condA, "_vs_", condB, ".csv"))
+    # Guarda los resultados solo si no existen previamente
     if (!file.exists(csv_file)) {
-      res_df <- topTable(fit2, number = Inf, adjust.method = "BH")
-      write.csv(res_df, csv_file)
+      write.table(res_df, csv_file, sep=";", row.names=FALSE)
+      write.xlsx(res_df, sub(".csv", ".xlsx", csv_file), row.names=FALSE)
     }
+    
+    # Crea el gráfico tipo Volcano plot
+    # Muestra los genes significativos (rojos) vs no significativos (grises)
+    # Ejes: log2FoldChange vs -log10(padj)
+    plot_volcano(res_df, file.path(output_dir, paste0("Volcano_", condA, "_vs_", condB, ".png")))
+    
+    # Ejecuta la anotación funcional y el análisis de enriquecimiento KEGG
+    # Usa biomaRt y clusterProfiler
+    anotar_y_enriquecer(res_df, especie, output_dir)
   }
   
-  file.create(flag_file)
+  # Marca la ejecución completada creando un archivo “flag”
+  # Esto evita repetir el análisis si ya se ha hecho
+  file.create(res_flag)
 }
+
 
 # =========================================================
 # 🚀 Loop principal
 # =========================================================
 for (esp in species_list) {
   message("🔍 Procesando especie: ", esp)
-  
   muestras_esp <- samples[samples$species==esp,]
   diseno <- setNames(muestras_esp$group, muestras_esp$sample_id)
   
-  # Preparar referencias
   ref <- preparar_referencia(esp)
-  
   outdir_esp <- file.path(output_base, "output", esp)
   dir.create(outdir_esp, recursive = TRUE, showWarnings = FALSE)
   
@@ -375,27 +430,17 @@ for (esp in species_list) {
     fq1 <- file.path(data_path, muestras_esp$read1[i])
     fq2 <- file.path(data_path, muestras_esp$read2[i])
     bam_out <- file.path(outdir_esp, paste0(sid, ".bam"))
-    
-    qc_dir <- file.path(outdir_esp, paste0("QC_", sid))
-    
-    if (!dir.exists(qc_dir)) hacer_qc_fastq(fq1, qc_dir) # TODO CHECK
-    
-    if (!file.exists(bam_out)) {
-      alinear_muestra(fq1, fq2, ref$index, bam_out)
-    }
+    alinear_muestra(fq1, fq2, ref$index, bam_out)
     bam_files <- c(bam_files, bam_out)
   }
   
-  # Cuantificación
-  count_matrix <- cuantificar_todas(bam_files, ref$gtf, esp, output_base)
-  
-  # Subset de comparaciones válidas para esta especie
+  counts <- cuantificar_todas(bam_files, ref$gtf, esp, output_base)
+  counts <- filtrar_genes_bajos(counts, diseno, esp, output_base)
   compar_esp <- comparaciones[(comparaciones$control %in% diseno) & (comparaciones$treat %in% diseno),]
   
-  # Ejecutar DESeq2
-  comparaciones_deseq(count_matrix, diseno, compar_esp, outdir_esp, ref$gtf, muestras_esp)
-  
+  comparaciones_deseq(counts, diseno, compar_esp, outdir_esp, esp)
+                      
   # Ejecutar Limma-voom
-  comparaciones_limma(count_matrix, diseno, compar_esp, outdir_esp, muestras_esp)
+  #comparaciones_limma(count_matrix, diseno, compar_esp, outdir_esp, muestras_esp)
 }
 
