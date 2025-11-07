@@ -2,10 +2,8 @@
 # 🧩 Instalación de librerías necesarias (solo 1ª vez)
 # =========================================================
 #if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-
 #BiocManager::install(c("ShortRead", "Rsubread", "DESeq2", "pheatmap", "rtracklayer", "clusterProfiler", "AnnotationDbi", "edgeR", "biomaRt"), force = TRUE)
-
-#install.packages(c("openxlsx", "dplyr", "R.utils", "ggplot2"))
+#install.packages(c("openxlsx", "dplyr", "R.utils", "ggplot2", "stringr", "matrixStats"))
 
 # =========================================================
 # 📚 Librerías
@@ -23,6 +21,27 @@ library(biomaRt)
 library(openxlsx)
 library(R.utils)
 library(ggplot2)
+library(stringr)
+library(matrixStats) # Asegurando que rowVars esté disponible
+
+# =========================================================
+# 🔬 Parámetros Experimentales (Ajustables por Biólogo)
+# =========================================================
+
+# 💻 Parámetros de Rendimiento (CPU/Tiempo)
+NUM_THREADS <- 4                  # 🔹 Número de núcleos de CPU a usar para alineamiento y conteo.
+TIMEOUT_DOWNLOAD_SEC <- 600       # 🔹 Tiempo máximo (segundos) para la descarga de referencias FASTA/GTF.
+
+# 🧹 Parámetros de Filtrado Inicial (edgeR)
+UMBRAL_EXPRESION_MINIMA <- 10     # 🔹 Mínimo de conteos (CPM o valor) que un gen debe alcanzar para ser considerado expresado y retenido.
+
+# 🧪 Parámetros de Significación (DESeq2/Resultados)
+ALFA_P_ADJ <- 0.05                # 🔹 Umbral de p-valor ajustado (FDR) para considerar un gen como diferencialmente expresado (DE).
+UMBRAL_LOG2FC <- 1                # 🔹 Umbral de log2(Fold Change). Se usa en el Volcano Plot para marcar los genes DE (si es > 1).
+UMBRAL_GENES_ENRIQ <- 1           # 🔹 Mínimo de genes DE significativos necesarios para ejecutar el análisis de enriquecimiento KEGG.
+
+# 🧬 Parámetros de Enriquecimiento Funcional (clusterProfiler/KEGG)
+KEGG_P_CUTOFF <- 0.05             # 🔹 P-valor de corte para los resultados del análisis KEGG.
 
 # =========================================================
 # 🔧 Función para normalizar rutas
@@ -30,10 +49,12 @@ library(ggplot2)
 normalize_path_slash <- function(path) gsub("\\\\", "/", path)
 
 # =========================================================
-# 📝 Variables de usuario
+# 📝 Variables de usuario (Rutas)
 # =========================================================
+# ⚠️ AJUSTAR ESTAS RUTAS ANTES DE EJECUTAR
 base_path <- "/media/puente/sharge/BMK_DATA_20250611162313_1/Data"
 output_path <- "/media/puente/Expansion/Resultados_Primers_Filtrados"
+
 data_path <- normalize_path_slash(base_path)
 output_base <- normalize_path_slash(output_path)
 
@@ -44,6 +65,8 @@ dir.create(file.path(output_base, "output"), showWarnings = FALSE, recursive = T
 # =========================================================
 # 📂 Lectura de metadata
 # =========================================================
+# Se asume que los archivos 'muestras.csv' y 'comparaciones.csv'
+# están en el directorio de trabajo donde se ejecuta el script.
 samples <- read.csv("muestras.csv", stringsAsFactors = FALSE)
 comparaciones <- read.csv("comparaciones.csv", stringsAsFactors = FALSE)
 
@@ -82,7 +105,7 @@ preparar_referencia <- function(especie) {
     ext <- tolower(tools::file_ext(fasta_file))
   } else {
     tmp_file <- file.path(ref_dir, "tmp_genome.gz")
-    options(timeout = 600)
+    options(timeout = TIMEOUT_DOWNLOAD_SEC) # Usando variable global
     download.file(urls$fasta, destfile = tmp_file, mode = "wb")
     ext <- ifelse(grepl("\\.fna\\.gz$", urls$fasta, ignore.case = TRUE), "fna", "fa")
     fasta_file <- file.path(ref_dir, paste0(especie, ".", ext))
@@ -110,7 +133,10 @@ preparar_referencia <- function(especie) {
   if (file.exists(paste0(index_prefix, ".reads"))) {
     message("⏩ Índice ya existe para ", especie)
   } else {
+    # ⚠️ RECALCULA EL ÍNDICE si falta
+    message("⏳ Generando índice con Rsubread::buildindex...")
     buildindex(basename = index_prefix, reference = fasta_file)
+    message("✅ Índice generado.")
   }
   
   list(fasta = fasta_file, gtf = gtf_file, index = index_prefix)
@@ -134,7 +160,7 @@ alinear_muestra <- function(fq1, fq2, index_path, output_bam) {
   }
   align(index = index_path, readfile1 = fq1, readfile2 = fq2,
         output_file = output_bam, input_format = "gzFASTQ",
-        output_format = "BAM", nthreads = 4)
+        output_format = "BAM", nthreads = NUM_THREADS) # Usando variable global
 }
 
 # =========================================================
@@ -154,7 +180,8 @@ cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) 
   ext <- tolower(tools::file_ext(annotation_file))
   
   # Leer primeras líneas para decidir cómo proceder
-  gtf_lines <- readLines(annotation_file, n = 200)
+  # n = 200 es un valor fijo de control para la detección de formato
+  gtf_lines <- readLines(annotation_file, n = 200) 
   has_gene_id <- any(grepl("gene_id", gtf_lines))
   has_parent <- any(grepl("Parent=", gtf_lines))
   has_id <- any(grepl("ID=", gtf_lines))
@@ -184,7 +211,7 @@ cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) 
     GTF.featureType = feature_type,
     GTF.attrType = attr_type,
     isPairedEnd = TRUE,
-    nthreads = 4
+    nthreads = NUM_THREADS # Usando variable global
   )
   
   # Limpiar IDs si vienen con '.exon.#'
@@ -201,14 +228,9 @@ cuantificar_todas <- function(bam_files, annotation_file, especie, output_base) 
 }
 
 # =========================================================
-# ⚙️ Parámetros de filtrado globales
-# =========================================================
-umbral_expr <- 10  # 🔹 Puedes ajustar este valor para cambiar el umbral de expresión mínima
-
-# =========================================================
 # 🧹 Filtrado de genes poco expresados (edgeR)
 # =========================================================
-filtrar_genes_bajos <- function(count_matrix, group, especie, output_base, umbral = umbral_expr) {
+filtrar_genes_bajos <- function(count_matrix, group, especie, output_base, umbral = UMBRAL_EXPRESION_MINIMA) { # Usando variable global como default
   message("🔎 Filtrando genes con umbral de expresión mínimo = ", umbral)
   
   # Crear objeto DGEList
@@ -251,13 +273,17 @@ filtrar_genes_bajos <- function(count_matrix, group, especie, output_base, umbra
 # =========================================================
 # 🌿 Anotación y enriquecimiento funcional
 # =========================================================
-anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 0.05) {
-  sig <- res_df %>% filter(!is.na(padj), padj < alfa)
-  if (nrow(sig) < umbral) {
-    message("⚠️ Se han encontrado ", nrow(sig)," genes significativos menos de ", umbral, "genes significativos para un alfa igual a ", ,". Se omite enriquecimiento.")
+anotar_y_enriquecer <- function(res_df, especie, output_dir,
+                                umbral_min_genes = UMBRAL_GENES_ENRIQ, # Usando variable global
+                                alfa_padj = ALFA_P_ADJ, # Usando variable global
+                                kegg_p_cutoff = KEGG_P_CUTOFF) { # Usando variable global
+  
+  sig <- res_df %>% filter(!is.na(padj), padj < alfa_padj)
+  if (nrow(sig) < umbral_min_genes) {
+    message("⚠️ Se han encontrado ", nrow(sig)," genes significativos, que es menos de ", umbral_min_genes, "genes significativos requeridos. Se omite enriquecimiento.")
     return(NULL)
   }
-
+  
   # ---------------------------------------------------------
   # CHLAMYDOMONAS: normalización robusta de gene names
   # ---------------------------------------------------------
@@ -268,10 +294,7 @@ anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 
     org <- "cre"
     mart <- useDataset(dataset = dataset, mart = plant_mart)
     
-    # Normalización robusta:
-    # 1) intentamos extraer el patrón 'Cre...g<digits>' (ej. Cre01.g000050)
-    # 2) si falla, hacemos un fallback de eliminar sufijos tipo _digits(.vX)
-    # 3) marcamos casos no extraídos con nota
+    # Normalización robusta: (mismo código)
     sig <- sig %>%
       mutate(
         gene_id = as.character(gene_id),
@@ -279,32 +302,26 @@ anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 
         note = NA_character_
       )
     
-    # Fallback: si gene_base es NA, intentar quitar sufijos del estilo _1234.v6.1
     idx_na <- which(is.na(sig$gene_base))
     if (length(idx_na) > 0) {
       sig$gene_base[idx_na] <- sub("_\\d+(?:\\.\\d+)*\\.v[0-9\\.]+$", "",
                                    sig$gene_id[idx_na], perl = TRUE)
-      # Después del fallback intentar extraer de nuevo si hay algo parecido
       sig$gene_base[idx_na] <- str_extract(sig$gene_base[idx_na], "Cre[A-Za-z0-9]+\\.g\\d+")
-      # Marcar nota si seguimos sin extraer
       still_na <- idx_na[is.na(sig$gene_base[idx_na])]
       if (length(still_na) > 0) {
         sig$note[still_na] <- "no_pattern_extracted"
       }
     }
     
-    # Opcional: descartar explícitamente contigs como CreCp* (si quieres)
-    # Marcamos esos como 'discarded_contig' para no intentar mapearlos
     cp_idx <- grep("^CreCp\\.", sig$gene_id)
     if (length(cp_idx) > 0) {
       sig$note[cp_idx] <- ifelse(is.na(sig$note[cp_idx]), "discarded_contig_CreCp", paste(sig$note[cp_idx], "discarded_contig_CreCp", sep=";"))
       sig$gene_base[cp_idx] <- NA_character_
     }
     
-    # Imprimir lo que vamos a intentar mapear
     message("🧩 Genes que intentaremos mapear (formato limpio, NA=descartado):")
     for (i in seq_len(nrow(sig))) {
-      message(sprintf("   • original: %s  -> base: %s  note: %s", sig$gene_id[i], ifelse(is.na(sig$gene_base[i]), "<NA>", sig$gene_base[i]), ifelse(is.na(sig$note[i]), "-", sig$note[i])))
+      message(sprintf("   • original: %s  -> base: %s  note: %s", sig$gene_id[i], ifelse(is.na(sig$gene_base[i]), "<NA>", sig$gene_base[i]), ifelse(is.na(sig$note[i]), "-", sig$note[i])))
     }
     
     # Mapear solo los gene_base no NA
@@ -347,16 +364,15 @@ anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 
     }
     
     message("✅ Genes mapeados correctamente (count): ", length(mapped_genes))
-    for (g in mapped_genes) message("   • ", g)
+    for (g in mapped_genes) message("   • ", g)
     
     message("🔬 Ejecutando enriquecimiento KEGG para Chlamy (", org, ")...")
     ekegg <- enrichKEGG(
       gene = mapped_genes,
       organism = org,
-      pvalueCutoff = 0.05
+      pvalueCutoff = kegg_p_cutoff # Usando variable global
     )
     
-    # Si quieres, aquí puedes añadir: devolver mapping_table junto con ekegg_df
     if (is.null(ekegg) || nrow(as.data.frame(ekegg)) == 0) {
       message("⚠️ No se encontraron rutas KEGG significativas para Chlamy.")
       return(list(mapping = mapping_table, kegg = NULL))
@@ -385,7 +401,7 @@ anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 
     entrez_ids <- na.omit(unique(sig$entrez_id))
     
     message("🧩 GeneIDs detectados para enriquecimiento:")
-    for (g in entrez_ids) message("   • ", g)
+    for (g in entrez_ids) message("   • ", g)
     
     # Guardar tabla de mapeo
     mapping_file <- file.path(output_dir, paste0("gene_mapping_", especie, ".csv"))
@@ -401,7 +417,7 @@ anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 
       gene = entrez_ids,
       organism = org,
       keyType = "ncbi-geneid",
-      pvalueCutoff = 0.05
+      pvalueCutoff = kegg_p_cutoff # Usando variable global
     )
     
   } else {
@@ -439,8 +455,9 @@ anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 
 # =========================================================
 plot_volcano <- function(res_df, output_file) {
   res_df <- na.omit(res_df)
+  # Usando variables globales para los umbrales de color:
   gg <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
-    geom_point(aes(color = padj < 0.05 & abs(log2FoldChange) > 1)) +
+    geom_point(aes(color = padj < ALFA_P_ADJ & abs(log2FoldChange) > UMBRAL_LOG2FC)) +
     theme_minimal() +
     xlab("log2 Fold Change") + ylab("-log10(padj)") +
     scale_color_manual(values = c("grey", "red")) +
@@ -450,7 +467,8 @@ plot_volcano <- function(res_df, output_file) {
 
 plot_heatmap <- function(dds, output_file) {
   vsd <- vst(dds, blind = TRUE)
-  topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+  # Asegurando que matrixStats::rowVars esté disponible.
+  topVarGenes <- head(order(matrixStats::rowVars(assay(vsd)), decreasing = TRUE), 50)
   mat <- assay(vsd)[topVarGenes, ]
   mat <- mat - rowMeans(mat)
   pheatmap(mat, cluster_rows = TRUE, cluster_cols = TRUE,
@@ -464,37 +482,27 @@ comparaciones_deseq <- function(conteos, diseno, comparaciones_esp, output_dir, 
   
   # Flag de control: si el archivo existe, significa que ya se ejecutó DESeq2 previamente
   res_flag <- file.path(output_dir, "deseq_done.flag")
-  if (file.exists(res_flag)) 
+  if (file.exists(res_flag))  
     return(message("⏩ DESeq2 ya ejecutado."))
   
   # Crea la tabla de metadatos de las muestras (colData)
-  # 'diseno' contiene las condiciones (por ejemplo: control, tratado)
-  # names(diseno) son los IDs de las muestras (coinciden con las columnas de 'conteos')
   colData <- data.frame(condition = factor(diseno), row.names = names(diseno))
   
   # Crea el objeto DESeqDataSet con la matriz de conteos y las condiciones
-  # 'design = ~condition' define el modelo a ajustar (efecto de la condición experimental)
   dds <- DESeqDataSetFromMatrix(countData = conteos, colData = colData, design = ~condition)
   
   # Ejecuta todo el pipeline interno de DESeq2:
-  # 1. Estima factores de normalización (size factors)
-  # 2. Calcula la dispersión por gen (biológica y técnica)
-  # 3. Ajusta el modelo de binomial negativa (NB)
-  # 4. Realiza los tests estadísticos para detectar genes diferencialmente expresados
   dds <- DESeq(dds)
   
   # Genera un heatmap de los 50 genes con mayor varianza entre muestras
-  # Esto permite ver la separación global entre condiciones
   plot_heatmap(dds, file.path(output_dir, "heatmap_top50.png"))
   
   # Recorre cada comparación indicada en la tabla 'comparaciones_esp'
-  # Cada fila contiene dos condiciones: control y tratada
   for (i in 1:nrow(comparaciones_esp)) {
     condA <- comparaciones_esp$control[i]  # condición control
     condB <- comparaciones_esp$treat[i]    # condición tratada
     
     # Extrae los resultados del contraste (condB vs condA)
-    # Incluye log2FoldChange, estadísticos, p-valor y p ajustado (padj)
     res <- results(dds, contrast = c("condition", condA, condB))
     
     # Convierte los resultados en un data.frame para manipularlos fácilmente
@@ -511,18 +519,15 @@ comparaciones_deseq <- function(conteos, diseno, comparaciones_esp, output_dir, 
       write.xlsx(res_df, sub(".csv", ".xlsx", csv_file), row.names=FALSE)
     }
     
-    # Crea el gráfico tipo Volcano plot
-    # Muestra los genes significativos (rojos) vs no significativos (grises)
-    # Ejes: log2FoldChange vs -log10(padj)
+    # Crea el gráfico tipo Volcano plot, usando los umbrales globales
     plot_volcano(res_df, file.path(output_dir, paste0("Volcano_", condA, "_vs_", condB, ".png")))
     
     # Ejecuta la anotación funcional y el análisis de enriquecimiento KEGG
-    # Usa biomaRt y clusterProfiler
+    # Los parámetros ahora se pasan de forma explícita/usando los valores globales por defecto
     anotar_y_enriquecer(res_df, especie, output_dir)
   }
   
   # Marca la ejecución completada creando un archivo “flag”
-  # Esto evita repetir el análisis si ya se ha hecho
   file.create(res_flag)
 }
 
@@ -550,12 +555,14 @@ for (esp in species_list) {
   }
   
   counts <- cuantificar_todas(bam_files, ref$gtf, esp, output_base)
-  counts <- filtrar_genes_bajos(counts, diseno, esp, output_base)
+  
+  # El filtrado usa el UMBRAL_EXPRESION_MINIMA definido al inicio
+  counts <- filtrar_genes_bajos(counts, diseno, esp, output_base) 
+  
   compar_esp <- comparaciones[(comparaciones$control %in% diseno) & (comparaciones$treat %in% diseno),]
   
   comparaciones_deseq(counts, diseno, compar_esp, outdir_esp, esp)
-                      
+  
   # Ejecutar Limma-voom
   #comparaciones_limma(count_matrix, diseno, compar_esp, outdir_esp, muestras_esp)
 }
-
