@@ -251,72 +251,187 @@ filtrar_genes_bajos <- function(count_matrix, group, especie, output_base, umbra
 # =========================================================
 # 🌿 Anotación y enriquecimiento funcional
 # =========================================================
-anotar_y_enriquecer <- function(res_df, especie, output_dir) {
-  sig <- res_df %>% filter(!is.na(padj), padj < 0.05)
-  if (nrow(sig) < 10) {
-    message("⚠️ Menos de 10 genes significativos. Se omite enriquecimiento.")
+anotar_y_enriquecer <- function(res_df, especie, output_dir, umbral = 1, alfa = 0.05) {
+  sig <- res_df %>% filter(!is.na(padj), padj < alfa)
+  if (nrow(sig) < umbral) {
+    message("⚠️ Se han encontrado ", nrow(sig)," genes significativos menos de ", umbral, "genes significativos para un alfa igual a ", ,". Se omite enriquecimiento.")
     return(NULL)
   }
-  
-  # 🔹 Conexión al mart de Ensembl Plants
-  message("🔗 Conectando a Ensembl Plants...")
-  plant_mart <- useEnsemblGenomes(biomart = "plants_mart", host = "https://plants.ensembl.org")
-  
-  # 🔹 Selección automática de dataset y organismo KEGG
+
+  # ---------------------------------------------------------
+  # CHLAMYDOMONAS: normalización robusta de gene names
+  # ---------------------------------------------------------
   if (tolower(especie) == "chlamy") {
+    message("🔗 Conectando a Ensembl Plants para Chlamydomonas reinhardtii...")
+    plant_mart <- useMart(biomart = "plants_mart", host = "https://plants.ensembl.org")
     dataset <- "creinhardtii_eg_gene"
     org <- "cre"
+    mart <- useDataset(dataset = dataset, mart = plant_mart)
+    
+    # Normalización robusta:
+    # 1) intentamos extraer el patrón 'Cre...g<digits>' (ej. Cre01.g000050)
+    # 2) si falla, hacemos un fallback de eliminar sufijos tipo _digits(.vX)
+    # 3) marcamos casos no extraídos con nota
+    sig <- sig %>%
+      mutate(
+        gene_id = as.character(gene_id),
+        gene_base = str_extract(gene_id, "Cre[A-Za-z0-9]+\\.g\\d+"),
+        note = NA_character_
+      )
+    
+    # Fallback: si gene_base es NA, intentar quitar sufijos del estilo _1234.v6.1
+    idx_na <- which(is.na(sig$gene_base))
+    if (length(idx_na) > 0) {
+      sig$gene_base[idx_na] <- sub("_\\d+(?:\\.\\d+)*\\.v[0-9\\.]+$", "",
+                                   sig$gene_id[idx_na], perl = TRUE)
+      # Después del fallback intentar extraer de nuevo si hay algo parecido
+      sig$gene_base[idx_na] <- str_extract(sig$gene_base[idx_na], "Cre[A-Za-z0-9]+\\.g\\d+")
+      # Marcar nota si seguimos sin extraer
+      still_na <- idx_na[is.na(sig$gene_base[idx_na])]
+      if (length(still_na) > 0) {
+        sig$note[still_na] <- "no_pattern_extracted"
+      }
+    }
+    
+    # Opcional: descartar explícitamente contigs como CreCp* (si quieres)
+    # Marcamos esos como 'discarded_contig' para no intentar mapearlos
+    cp_idx <- grep("^CreCp\\.", sig$gene_id)
+    if (length(cp_idx) > 0) {
+      sig$note[cp_idx] <- ifelse(is.na(sig$note[cp_idx]), "discarded_contig_CreCp", paste(sig$note[cp_idx], "discarded_contig_CreCp", sep=";"))
+      sig$gene_base[cp_idx] <- NA_character_
+    }
+    
+    # Imprimir lo que vamos a intentar mapear
+    message("🧩 Genes que intentaremos mapear (formato limpio, NA=descartado):")
+    for (i in seq_len(nrow(sig))) {
+      message(sprintf("   • original: %s  -> base: %s  note: %s", sig$gene_id[i], ifelse(is.na(sig$gene_base[i]), "<NA>", sig$gene_base[i]), ifelse(is.na(sig$note[i]), "-", sig$note[i])))
+    }
+    
+    # Mapear solo los gene_base no NA
+    values_to_map <- na.omit(unique(sig$gene_base))
+    genes_mapeados <- data.frame()
+    if (length(values_to_map) > 0) {
+      genes_mapeados <- getBM(
+        attributes = c("ensembl_gene_id", "external_gene_name"),
+        filters = "external_gene_name",
+        values = values_to_map,
+        mart = mart
+      )
+    }
+    
+    if (nrow(genes_mapeados) == 0) {
+      message("⚠️ getBM devolvió 0 filas para los nombres proporcionados (posible mismatch de versiones).")
+    } else {
+      message("🔍 Resultados de mapeo Ensembl (primeras filas):")
+      print(head(genes_mapeados))
+    }
+    
+    # Relacionar y marcar mapped TRUE/FALSE
+    sig$mapped_gene <- NA_character_
+    if (nrow(genes_mapeados) > 0) {
+      sig$mapped_gene <- genes_mapeados$ensembl_gene_id[match(sig$gene_base, genes_mapeados$external_gene_name)]
+    }
+    sig$mapped <- !is.na(sig$mapped_gene)
+    
+    # Guardar tabla de mapeo (incluye nota y estado)
+    mapping_file <- file.path(output_dir, paste0("gene_mapping_", especie, ".csv"))
+    mapping_table <- sig %>% dplyr::select(gene_id, gene_base, mapped_gene, mapped, note)
+    write.table(mapping_table, mapping_file, sep = ";", row.names = FALSE, quote = FALSE)
+    message("💾 Archivo de mapeo guardado en: ", mapping_file)
+    
+    # Preparar vector para enrichKEGG: usamos mapped_gene (IDs Ensembl) como antes
+    mapped_genes <- unique(na.omit(sig$mapped_gene))
+    if (length(mapped_genes) == 0) {
+      message("⚠️ No se encontraron genes mapeados a Ensembl. Se omite enriquecimiento KEGG para Chlamy.")
+      return(mapping_table)  # devolvemos el mapping para que lo revises
+    }
+    
+    message("✅ Genes mapeados correctamente (count): ", length(mapped_genes))
+    for (g in mapped_genes) message("   • ", g)
+    
+    message("🔬 Ejecutando enriquecimiento KEGG para Chlamy (", org, ")...")
+    ekegg <- enrichKEGG(
+      gene = mapped_genes,
+      organism = org,
+      pvalueCutoff = 0.05
+    )
+    
+    # Si quieres, aquí puedes añadir: devolver mapping_table junto con ekegg_df
+    if (is.null(ekegg) || nrow(as.data.frame(ekegg)) == 0) {
+      message("⚠️ No se encontraron rutas KEGG significativas para Chlamy.")
+      return(list(mapping = mapping_table, kegg = NULL))
+    }
+    
+    ekegg_df <- as.data.frame(ekegg)
+    write.table(ekegg_df, file.path(output_dir, paste0("KEGG_", especie, ".csv")), sep = ";", row.names = FALSE)
+    openxlsx::write.xlsx(ekegg_df, file.path(output_dir, paste0("KEGG_", especie, ".xlsx")))
+    message("✅ Enriquecimiento completado para ", especie)
+    return(list(mapping = mapping_table, kegg = ekegg_df))
+    
+    
+    # =========================================================
+    # 🌱 LOLIUM PERENNE (RefSeq v6.1)
+    # =========================================================
   } else if (tolower(especie) == "lolium") {
-    dataset <- "lperenne_eg_gene"
-    org <- "lpe"
+    message("🌿 Procesando *Lolium perenne* (RefSeq v6.1)...")
+    
+    org <- "lper"
+    
+    # Extraer IDs numéricos de GeneID o LOC
+    sig <- sig %>%
+      mutate(entrez_id = sub("^LOC", "", gene_id)) %>%
+      mutate(entrez_id = sub("^GeneID:", "", entrez_id))
+    
+    entrez_ids <- na.omit(unique(sig$entrez_id))
+    
+    message("🧩 GeneIDs detectados para enriquecimiento:")
+    for (g in entrez_ids) message("   • ", g)
+    
+    # Guardar tabla de mapeo
+    mapping_file <- file.path(output_dir, paste0("gene_mapping_", especie, ".csv"))
+    write.table(
+      data.frame(gene_id = sig$gene_id, entrez_id = sig$entrez_id),
+      mapping_file, sep = ";", row.names = FALSE
+    )
+    message("💾 Archivo de mapeo guardado en: ", mapping_file)
+    
+    # Enriquecimiento KEGG
+    message("🔬 Ejecutando enriquecimiento KEGG para Lolium (", org, ")...")
+    ekegg <- enrichKEGG(
+      gene = entrez_ids,
+      organism = org,
+      keyType = "ncbi-geneid",
+      pvalueCutoff = 0.05
+    )
+    
   } else {
-    message("⚠️ Especie no reconocida para anotar_y_enriquecer: ", especie)
+    message("⚠️ Especie no reconocida: ", especie)
     return(NULL)
   }
   
-  message("🧬 Conectando dataset: ", dataset)
-  mart <- useDataset(dataset = dataset, mart = plant_mart)
-  
-  # 🔹 Mapear IDs (de tu tabla a Ensembl)
-  genes_mapeados <- getBM(
-    attributes = c("ensembl_gene_id", "external_gene_name"),
-    filters = "ensembl_gene_id",
-    values = sig$gene_id,
-    mart = mart
-  )
-  
-  if (nrow(genes_mapeados) == 0) {
-    message("⚠️ No se pudieron mapear IDs de genes para ", especie)
-    return(NULL)
-  }
-  
-  sig$mapped_gene <- genes_mapeados$external_gene_name[
-    match(sig$gene_id, genes_mapeados$ensembl_gene_id)
-  ]
-  
-  mapped_genes <- na.omit(unique(sig$mapped_gene))
-  
-  # 🔹 Enriquecimiento KEGG
-  message("🔍 Ejecutando enriquecimiento KEGG para ", especie, " (", org, ")...")
-  ekegg <- enrichKEGG(
-    gene = mapped_genes,
-    organism = org,
-    pvalueCutoff = 0.05
-  )
-  
+  # =========================================================
+  # ✅ Procesar resultados y exportar
+  # =========================================================
   if (is.null(ekegg) || nrow(as.data.frame(ekegg)) == 0) {
     message("⚠️ No se encontraron rutas KEGG significativas para ", especie)
     return(NULL)
   }
   
   ekegg_df <- as.data.frame(ekegg)
-  write.table(ekegg_df,
-              file.path(output_dir, paste0("KEGG_", especie, ".csv")),
-              sep = ";", row.names = FALSE)
-  openxlsx::write.xlsx(ekegg_df,
-                       file.path(output_dir, paste0("KEGG_", especie, ".xlsx")))
+  message("📈 Rutas KEGG significativas encontradas: ", nrow(ekegg_df))
+  
+  write.table(
+    ekegg_df,
+    file.path(output_dir, paste0("KEGG_", especie, ".csv")),
+    sep = ";", row.names = FALSE
+  )
+  openxlsx::write.xlsx(
+    ekegg_df,
+    file.path(output_dir, paste0("KEGG_", especie, ".xlsx"))
+  )
   
   message("✅ Enriquecimiento completado para ", especie)
+  return(ekegg_df)
 }
 
 # =========================================================
